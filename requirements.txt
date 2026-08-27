@@ -1,0 +1,7 @@
+PyGObject>=3.42
+qrcode>=7.4
+Pillow>=9.0
+psutil>=5.9
+# netifaces is OPTIONAL: unmaintained, fails to build on Python 3.12+.
+# NetworkDetector falls back to stdlib socket/ioctl detection when absent.
+# netifaces>=0.11
