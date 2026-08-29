@@ -29,6 +29,7 @@ class SavedService:
     port: int | None = None
     folder_path: str | None = None
     auto_start: bool = False
+    hostname: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize to a JSON-compatible dictionary."""
@@ -39,6 +40,7 @@ class SavedService:
             "port": self.port,
             "folder_path": self.folder_path,
             "auto_start": self.auto_start,
+            "hostname": self.hostname,
         }
 
     @classmethod
@@ -46,6 +48,7 @@ class SavedService:
         """Rebuild a SavedService from its dictionary form."""
         port_value = data.get("port")
         folder_value = data.get("folder_path")
+        hostname_value = data.get("hostname")
         return cls(
             id=str(data["id"]),
             name=str(data["name"]),
@@ -53,6 +56,7 @@ class SavedService:
             port=int(port_value) if port_value is not None else None,
             folder_path=str(folder_value) if folder_value is not None else None,
             auto_start=bool(data.get("auto_start", False)),
+            hostname=str(hostname_value) if hostname_value is not None else None,
         )
 
 
@@ -71,6 +75,7 @@ class Service:
     connected_devices: int = 0
     qr_image_path: str | None = None
     auto_start: bool = False
+    hostname: str | None = None
 
     def to_saved(self) -> SavedService:
         """Project this runtime service into its persistent form."""
@@ -81,4 +86,5 @@ class Service:
             port=self.port,
             folder_path=self.folder_path,
             auto_start=self.auto_start,
+            hostname=self.hostname,
         )

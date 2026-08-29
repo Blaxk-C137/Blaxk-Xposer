@@ -79,6 +79,11 @@ class ExposePortWindow(Gtk.Window):
         self._port_spin = Gtk.SpinButton(adjustment=adjustment, climb_rate=1.0)
         form.attach(self._port_spin, 1, 1, 1, 1)
 
+        form.attach(Gtk.Label(label="Hostname", halign=Gtk.Align.START), 0, 2, 1, 1)
+        self._hostname_entry = Gtk.Entry(hexpand=True)
+        self._hostname_entry.set_placeholder_text("myapp  (becomes myapp.local)")
+        form.attach(self._hostname_entry, 1, 2, 1, 1)
+
         ports_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         ports_header.pack_start(
             Gtk.Label(label="Detected Running Ports", halign=Gtk.Align.START),
@@ -203,10 +208,11 @@ class ExposePortWindow(Gtk.Window):
             show_error(self, "Please enter a service name.")
             return
         port = int(self._port_spin.get_value())
+        hostname = self._hostname_entry.get_text().strip() or None
         self._set_busy(True)
 
         def work() -> tuple[Service, bool]:
-            service = self._service_manager.expose_port(name, port)
+            service = self._service_manager.expose_port(name, port, hostname)
             reachable = self._service_manager.lan_reachable(service)
             return service, reachable
 

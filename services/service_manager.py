@@ -12,6 +12,7 @@ from pathlib import Path
 
 from config.config_store import ConfigStore
 from models.service import Service, ServiceStatus, ServiceType
+from network.mdns_publisher import MdnsPublisher, normalize_hostname, to_local_name
 from network.network_detector import NetworkDetector
 from network.qr_generator import QRGenerator
 from services.file_server import FileServer, FileServerError
@@ -88,6 +89,7 @@ class ServiceManager:
         qr_generator: QRGenerator,
         proxy_engine: ProxyEngine | None = None,
         file_server: FileServer | None = None,
+        mdns_publisher: MdnsPublisher | None = None,
         monitor_interval: float = MONITOR_INTERVAL_SECONDS,
     ) -> None:
         self._config_store = config_store
@@ -95,6 +97,7 @@ class ServiceManager:
         self._qr_generator = qr_generator
         self._proxy_engine = proxy_engine if proxy_engine is not None else ProxyEngine()
         self._file_server = file_server if file_server is not None else FileServer()
+        self._mdns = mdns_publisher if mdns_publisher is not None else MdnsPublisher()
         self._monitor_interval = monitor_interval
         self._services: dict[str, Service] = {}
         self._observers: list[Callable[[str], None]] = []
@@ -160,7 +163,9 @@ class ServiceManager:
 
     # ---- lifecycle ----
 
-    def expose_port(self, name: str, port: int) -> Service:
+    def expose_port(
+        self, name: str, port: int, hostname: str | None = None
+    ) -> Service:
         """Expose an already-running localhost port to the LAN."""
         trimmed = name.strip()
         if not trimmed:
@@ -169,15 +174,18 @@ class ServiceManager:
             raise ValidationError("Port must be between 1 and 65535.")
         if not self._detector.is_port_in_use(port):
             raise PortNotListeningError(f"Nothing listens on localhost:{port}")
+        fqdn = self._prepare_hostname(hostname)
 
-        listen_host, assigned_port = self._pick_proxy_binding(port)
+        lan_ip = self.current_lan_ip()
+        listen_host, assigned_port = self._pick_proxy_binding(port, lan_ip)
         service = Service(
             id=str(uuid.uuid4()),
             name=trimmed,
             type=ServiceType.PORT,
             port=port,
             assigned_port=assigned_port,
-            lan_url=f"http://{self.current_lan_ip()}:{assigned_port}",
+            lan_url=f"http://{lan_ip}:{assigned_port}",
+            hostname=fqdn,
         )
         try:
             self._proxy_engine.start_proxy(
@@ -185,21 +193,26 @@ class ServiceManager:
             )
         except ProxyError as exc:
             raise PortBindError(str(exc)) from exc
+        self._apply_hostname_url(service, lan_ip)
         self._activate(service)
         logger.info(f"Exposed port {port} as {service.lan_url}")
         return service
 
-    def serve_folder(self, name: str, folder_path: str) -> Service:
+    def serve_folder(
+        self, name: str, folder_path: str, hostname: str | None = None
+    ) -> Service:
         """Serve a local folder as a static HTTP service."""
         trimmed = name.strip()
         if not trimmed:
             raise ValidationError("Service name must not be empty.")
+        fqdn = self._prepare_hostname(hostname)
         folder = Path(folder_path).expanduser()
         if not folder.is_dir():
             raise FolderInvalidError(f"No such folder: {folder}")
         if not any(folder.iterdir()):
             raise FolderInvalidError(f"Folder is empty: {folder}")
 
+        lan_ip = self.current_lan_ip()
         assigned_port = self._detector.find_available_port()
         if assigned_port is None:
             raise PortBindError("No free network port available.")
@@ -209,12 +222,14 @@ class ServiceManager:
             type=ServiceType.FOLDER,
             folder_path=str(folder),
             assigned_port=assigned_port,
-            lan_url=f"http://{self.current_lan_ip()}:{assigned_port}",
+            lan_url=f"http://{lan_ip}:{assigned_port}",
+            hostname=fqdn,
         )
         try:
             self._file_server.start_server(service.id, folder, assigned_port)
         except FileServerError as exc:
             raise PortBindError(str(exc)) from exc
+        self._apply_hostname_url(service, lan_ip)
         self._activate(service)
         logger.info(f"Serving folder {folder} as {service.lan_url}")
         return service
@@ -229,6 +244,8 @@ class ServiceManager:
             self._proxy_engine.stop_proxy(service_id)
         else:
             self._file_server.stop_server(service_id)
+        if service.hostname is not None:
+            self._mdns.unpublish(service.hostname)
         with self._lock:
             service.status = ServiceStatus.STOPPED
             service.connected_devices = 0
@@ -272,7 +289,11 @@ class ServiceManager:
                 self._file_server.start_server(service_id, folder, assigned_port)
             except FileServerError as exc:
                 raise PortBindError(str(exc)) from exc
-        lan_url = f"http://{self.current_lan_ip()}:{assigned_port}"
+        lan_ip = self.current_lan_ip()
+        lan_url = f"http://{lan_ip}:{assigned_port}"
+        if service.hostname is not None:
+            self._apply_hostname_url(service, lan_ip)
+            lan_url = service.lan_url
         qr_image_path = str(
             self._qr_generator.generate(service.name, lan_url)
         )
@@ -330,9 +351,37 @@ class ServiceManager:
             self._monitor_thread = None
         self._proxy_engine.stop_all()
         self._file_server.stop_all()
+        self._mdns.stop_all()
         logger.info("ServiceManager shut down")
 
     # ---- internals ----
+
+    def _prepare_hostname(self, hostname: str | None) -> str | None:
+        """Normalize optional user input into a .local name (None if blank)."""
+        if hostname is None or not hostname.strip():
+            return None
+        try:
+            return to_local_name(normalize_hostname(hostname))
+        except ValueError as exc:
+            raise ValidationError(
+                "Hostnames may only contain letters, numbers, and hyphens."
+            ) from exc
+
+    def _apply_hostname_url(self, service: Service, lan_ip: str) -> None:
+        """Swap the URL to hostname form when mDNS publishing succeeds.
+
+        A failed publish (no avahi, name taken) leaves the IP URL in
+        place; the hostname is still kept on the service so a restart
+        can retry publishing.
+        """
+        if service.hostname is None:
+            return
+        if self._mdns.publish(service.hostname, lan_ip):
+            service.lan_url = f"http://{service.hostname}:{service.assigned_port}"
+        else:
+            logger.warning(
+                f"Could not publish {service.hostname}; using {service.lan_url}"
+            )
 
     def _activate(self, service: Service) -> None:
         """Finish registration shared by both modes: QR, registry, notify."""
@@ -346,9 +395,12 @@ class ServiceManager:
         self._persist(service)
         self._notify(EVENT_SERVICES_CHANGED)
 
-    def _pick_proxy_binding(self, target_port: int) -> tuple[str, int]:
+    def _pick_proxy_binding(
+        self, target_port: int, lan_ip: str | None = None
+    ) -> tuple[str, int]:
         """Prefer binding the LAN IP on the same port; else any-host free port."""
-        lan_ip = self.current_lan_ip()
+        if lan_ip is None:
+            lan_ip = self.current_lan_ip()
         if self._detector.is_port_bindable(target_port, host=lan_ip):
             return lan_ip, target_port
         assigned = self._detector.find_available_port()

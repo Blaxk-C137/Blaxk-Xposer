@@ -72,6 +72,11 @@ class ServeFolderWindow(Gtk.Window):
         path_box.pack_end(browse, False, False, 0)
         form.attach(path_box, 1, 1, 1, 1)
 
+        form.attach(Gtk.Label(label="Hostname", halign=Gtk.Align.START), 0, 2, 1, 1)
+        self._hostname_entry = Gtk.Entry(hexpand=True)
+        self._hostname_entry.set_placeholder_text("mysite  (becomes mysite.local)")
+        form.attach(self._hostname_entry, 1, 2, 1, 1)
+
         self._spinner = Gtk.Spinner()
         outer.pack_start(self._spinner, False, False, 0)
 
@@ -126,9 +131,10 @@ class ServeFolderWindow(Gtk.Window):
             if not approved:
                 return
         self._set_busy(True)
+        hostname = self._hostname_entry.get_text().strip() or None
 
         def work() -> tuple[Service, bool]:
-            service = self._service_manager.serve_folder(name, raw_path)
+            service = self._service_manager.serve_folder(name, raw_path, hostname)
             reachable = self._service_manager.lan_reachable(service)
             return service, reachable
 
