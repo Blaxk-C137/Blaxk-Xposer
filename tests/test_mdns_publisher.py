@@ -12,11 +12,20 @@ from network.mdns_publisher import (
 
 
 class FakeProcess:
-    """Stands in for a Popen handle; records termination."""
+    """Stands in for a Popen handle; records termination.
 
-    def __init__(self) -> None:
+    exit_code simulates avahi-daemon rejecting the record: the process
+    is already dead when polled.
+    """
+
+    def __init__(self, exit_code: int | None = None) -> None:
         self.terminated = False
         self.killed = False
+        self.exit_code = exit_code
+        self.returncode = exit_code
+
+    def poll(self) -> int | None:
+        return self.exit_code
 
     def terminate(self) -> None:
         self.terminated = True
@@ -38,7 +47,7 @@ def make_publisher(process=None, error=None):
             raise error
         return process if process is not None else FakeProcess()
 
-    return MdnsPublisher(spawn=spawn), calls
+    return MdnsPublisher(spawn=spawn, settle_seconds=0.0), calls
 
 
 def test_publish_spawns_avahi_publish():
@@ -54,6 +63,18 @@ def test_publish_returns_false_when_avahi_missing():
     publisher, calls = make_publisher(error=FileNotFoundError("avahi-publish"))
     assert publisher.publish("myapp.local", "192.168.1.5") is False
     assert len(calls) == 1, "spawn should have been attempted exactly once"
+
+
+def test_publish_returns_false_when_avahi_rejects_name():
+    # A process that is already dead stands for a rejected record:
+    # avahi-publish exits ~0.05s after spawn when the daemon says no.
+    publisher, _ = make_publisher(process=FakeProcess(exit_code=1))
+    assert publisher.publish("-bad.local", "192.168.1.5") is False
+
+
+def test_publish_returns_true_while_process_stays_alive():
+    publisher, _ = make_publisher(process=FakeProcess(exit_code=None))
+    assert publisher.publish("myapp.local", "192.168.1.5") is True
 
 
 def test_unpublish_terminates_process():
@@ -103,10 +124,15 @@ def test_normalize_hostname(raw, expected):
     assert normalize_hostname(raw) == expected
 
 
-@pytest.mark.parametrize("raw", ["", "   ", "!!!", "a b!!c"])
+@pytest.mark.parametrize("raw", ["", "   ", "!!!", "a b!!c", "-lead", "trail-", "a" * 64])
 def test_normalize_hostname_rejects_garbage(raw):
     with pytest.raises(ValueError):
         normalize_hostname(raw)
+
+
+def test_normalize_hostname_accepts_single_char_and_63_chars():
+    assert normalize_hostname("a") == "a"
+    assert normalize_hostname("a" * 63) == "a" * 63
 
 
 def test_to_local_name_appends_suffix_once():

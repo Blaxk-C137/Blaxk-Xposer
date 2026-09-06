@@ -8,6 +8,7 @@ fall back to IP-based URLs, so sharing itself never breaks.
 
 import re
 import subprocess
+import time
 from collections.abc import Callable
 
 from utils.logger import get_logger
@@ -15,7 +16,10 @@ from utils.logger import get_logger
 logger = get_logger("network")
 
 LOCAL_SUFFIX = ".local"
-HOSTNAME_PATTERN = re.compile(r"^[a-z0-9-]+(\.local)?$")
+# One label: 1-63 chars, no leading/trailing hyphen (avahi rejects those).
+HOSTNAME_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.local)?$")
+# avahi-publish exits within ~50ms when the daemon rejects a record.
+SETTLE_SECONDS = 0.3
 
 
 def normalize_hostname(raw: str) -> str:
@@ -42,13 +46,21 @@ class MdnsPublisher:
     """Owns one avahi-publish process per hostname."""
 
     def __init__(
-        self, spawn: Callable[..., subprocess.Popen] = subprocess.Popen
+        self,
+        spawn: Callable[..., subprocess.Popen] = subprocess.Popen,
+        settle_seconds: float = SETTLE_SECONDS,
     ) -> None:
         self._spawn = spawn
+        self._settle_seconds = settle_seconds
         self._processes: dict[str, subprocess.Popen] = {}
 
     def publish(self, hostname: str, ip: str) -> bool:
-        """Announce hostname -> ip; return False when avahi is unusable."""
+        """Announce hostname -> ip; return False when avahi is unusable.
+
+        A spawned process that exits within the settle window means the
+        daemon rejected the record (invalid name, conflict); report that
+        as failure so callers keep their IP-based URL.
+        """
         self._terminate(hostname)
         try:
             process = self._spawn(
@@ -58,6 +70,13 @@ class MdnsPublisher:
             )
         except OSError as exc:
             logger.warning(f"mDNS publish unavailable for {hostname}: {exc}")
+            return False
+        if self._settle_seconds > 0:
+            time.sleep(self._settle_seconds)
+        if process.poll() is not None:
+            logger.warning(
+                f"avahi rejected {hostname} (exit {process.returncode})"
+            )
             return False
         self._processes[hostname] = process
         logger.info(f"Published {hostname} -> {ip}")

@@ -108,6 +108,22 @@ def test_restart_service_republishes_hostname(stack):
     assert ("myapp.local", manager.current_lan_ip()) in publisher.published
 
 
+def test_restart_failed_republish_falls_back_to_ip_url(stack):
+    manager, publisher, _ = stack
+    server, port = open_local_listener()
+    try:
+        service = manager.expose_port("App", port, hostname="myapp")
+        manager.stop_service(service.id)
+        publisher.publish_ok = False  # avahi dies between runs
+        manager.restart_service(service.id)
+        service = manager.get_service(service.id)
+    finally:
+        server.close()
+    assert service.lan_url == (
+        f"http://{manager.current_lan_ip()}:{service.assigned_port}"
+    ), "restart kept a stale hostname URL after failed republish"
+
+
 def test_serve_folder_with_hostname_uses_local_url(stack, tmp_path):
     manager, publisher, _ = stack
     site = tmp_path / "site"

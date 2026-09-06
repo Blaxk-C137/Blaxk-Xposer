@@ -290,16 +290,16 @@ class ServiceManager:
             except FileServerError as exc:
                 raise PortBindError(str(exc)) from exc
         lan_ip = self.current_lan_ip()
-        lan_url = f"http://{lan_ip}:{assigned_port}"
-        if service.hostname is not None:
-            self._apply_hostname_url(service, lan_ip)
-            lan_url = service.lan_url
-        qr_image_path = str(
-            self._qr_generator.generate(service.name, lan_url)
-        )
         with self._lock:
             service.assigned_port = assigned_port
-            service.lan_url = lan_url
+        if service.hostname is not None:
+            self._apply_hostname_url(service, lan_ip)
+        else:
+            service.lan_url = f"http://{lan_ip}:{assigned_port}"
+        qr_image_path = str(
+            self._qr_generator.generate(service.name, service.lan_url)
+        )
+        with self._lock:
             service.qr_image_path = qr_image_path
             service.status = ServiceStatus.RUNNING
         self._persist(service)
@@ -368,14 +368,17 @@ class ServiceManager:
             ) from exc
 
     def _apply_hostname_url(self, service: Service, lan_ip: str) -> None:
-        """Swap the URL to hostname form when mDNS publishing succeeds.
+        """Rewrite the URL for a service with a hostname.
 
-        A failed publish (no avahi, name taken) leaves the IP URL in
-        place; the hostname is still kept on the service so a restart
-        can retry publishing.
+        The IP URL is always rebuilt first (with the service's current
+        assigned port), then upgraded to hostname form only when mDNS
+        publishing succeeds. A failed publish (no avahi, name rejected
+        or taken) therefore leaves a correct, reachable IP URL — never
+        a stale hostname URL from a previous run.
         """
         if service.hostname is None:
             return
+        service.lan_url = f"http://{lan_ip}:{service.assigned_port}"
         if self._mdns.publish(service.hostname, lan_ip):
             service.lan_url = f"http://{service.hostname}:{service.assigned_port}"
         else:
