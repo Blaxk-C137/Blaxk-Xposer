@@ -5,11 +5,14 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk
 
-FIREWALL_WARNING_TITLE = "Possibly blocked by firewall"
-FIREWALL_HINT = (
-    "The service is running, but nothing answered on your LAN IP. A firewall "
-    "is probably blocking it. Allow inbound TCP traffic for the port in your "
-    "firewall settings (e.g. 'firewall-config' or 'sudo ufw allow <port>')."
+FIREWALL_RULE_FAILED_TEXT = (
+    "Windows did not add the firewall rule. You can allow Python manually in Windows Security."
+)
+UNREACHABLE_WARNING_TITLE = "Shared, but not answering on your network address"
+UNREACHABLE_HINT = (
+    "Xposer started the link, but a test connection to your network address "
+    "failed. If you use a VPN or several networks, pick the right network "
+    "interface in Settings. Use “Can't connect?” in the dashboard for firewall help."
 )
 
 

@@ -4,6 +4,7 @@ import http.server
 import socket
 import threading
 import time
+import urllib.error
 import urllib.request
 
 import pytest
@@ -128,7 +129,7 @@ def test_serve_folder_and_stop(manager, components):
     manager.stop_service(service.id)
     assert service.status == ServiceStatus.STOPPED
     assert manager.get_service(service.id) is not None
-    with pytest.raises(Exception):
+    with pytest.raises(urllib.error.URLError):
         urllib.request.urlopen(url, timeout=1)
 
     manager.restart_service(service.id)
@@ -187,9 +188,12 @@ def test_active_ports_reports_assigned(manager, components):
     assert service.assigned_port in manager.active_ports()
 
 
-def test_sensitive_folder_detection(manager):
+def test_sensitive_folder_detection(manager, tmp_path):
+    import sys
     from pathlib import Path
 
     assert manager.is_sensitive_folder(Path.home()) is True
     assert manager.is_sensitive_folder(Path("/")) is True
-    assert manager.is_sensitive_folder(Path("/etc")) is True
+    if sys.platform != "win32":
+        assert manager.is_sensitive_folder(Path("/etc")) is True
+    assert manager.is_sensitive_folder(tmp_path) is False

@@ -1,6 +1,6 @@
 """Tests for the service domain models."""
 
-from models.service import Service, ServiceStatus, ServiceType, SavedService
+from models.service import SavedService, Service, ServiceStatus, ServiceType
 
 
 def make_service() -> Service:

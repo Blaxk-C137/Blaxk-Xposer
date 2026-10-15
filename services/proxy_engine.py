@@ -1,213 +1,206 @@
-"""TCP reverse proxy exposing localhost ports to the LAN."""
+"""Reverse proxy exposing localhost ports to the LAN.
 
-import select
+All proxies share one asyncio event loop on a daemon thread (see
+utils.async_runner), so a dozen shared apps with hundreds of connections
+cost one thread instead of two threads per connection. The public API is
+synchronous and thread-safe; it is called from ServiceManager workers.
+"""
+
+import asyncio
 import socket
 import threading
+from collections.abc import Sequence
+from functools import partial
 
+from network.socket_utils import LOOPBACK_HOSTS, disable_nagle, open_listener
+from services.http_rewriter import RewriteMap
+from services.proxy_session import (
+    SESSION_ERRORS,
+    BufferedStream,
+    ClientGone,
+    ProxySession,
+    ProxyStatsSnapshot,
+    ProxyTarget,
+    StreamClosed,
+)
+from utils.async_runner import AsyncRunner
 from utils.logger import get_logger
 
 logger = get_logger("proxy")
 
 LISTEN_HOST_ANY = "0.0.0.0"
-UPSTREAM_HOST = "127.0.0.1"
-BACKLOG = 16
-SELECT_TIMEOUT_SECONDS = 1.0
-UPSTREAM_CONNECT_TIMEOUT_SECONDS = 5.0
-SEND_STALL_TIMEOUT_SECONDS = 30.0
-BUFFER_SIZE = 65536
-THREAD_JOIN_TIMEOUT_SECONDS = 2.0
+START_TIMEOUT_SECONDS = 5.0
+STOP_TIMEOUT_SECONDS = 5.0
+SERVER_CLOSE_WAIT_SECONDS = 2.0
 
 
 class ProxyError(RuntimeError):
     """Raised when a proxy listener cannot be established."""
 
 
-class _ProxyInstance:
-    """One listening socket forwarding connections to a localhost target."""
-
-    def __init__(
-        self, service_id: str, listen_host: str, listen_port: int, target_port: int
-    ) -> None:
-        self.service_id = service_id
-        self.listen_host = listen_host
-        self.listen_port = listen_port
-        self.target_port = target_port
-        self._listener: socket.socket | None = None
-        self._accept_thread: threading.Thread | None = None
-        self._client_ips: set[str] = set()
-        self._lock = threading.Lock()
-        self._stopping = threading.Event()
-
-    @property
-    def connected_devices(self) -> int:
-        """Unique client IPs seen since this instance started."""
-        with self._lock:
-            return len(self._client_ips)
-
-    def start(self) -> None:
-        """Bind and begin accepting; raises ProxyError on failure."""
-        try:
-            self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._listener.bind((self.listen_host, self.listen_port))
-            self._listener.listen(BACKLOG)
-            # Non-blocking: _accept_loop gates accept() behind select() so the
-            # loop can notice _stopping instead of parking in the kernel.
-            self._listener.setblocking(False)
-        except OSError as exc:
-            if self._listener is not None:
-                self._listener.close()
-                self._listener = None
-            raise ProxyError(f"Cannot bind port {self.listen_port}: {exc}") from exc
-        self._accept_thread = threading.Thread(
-            target=self._accept_loop,
-            name=f"xposer-proxy-{self.listen_port}",
-            daemon=True,
-        )
-        self._accept_thread.start()
-        logger.info(
-            f"Proxying {self.listen_host}:{self.listen_port} -> "
-            f"{UPSTREAM_HOST}:{self.target_port}"
-        )
-
-    def stop(self) -> None:
-        """Drain the accept loop within one select timeout, then close."""
-        self._stopping.set()
-        # Join before close: Linux keeps a listening socket alive (still
-        # accepting handshakes) until an in-flight accept()/select() on
-        # another thread returns, so closing first would leave the port
-        # reachable. The loop wakes within SELECT_TIMEOUT_SECONDS.
-        if self._accept_thread is not None:
-            self._accept_thread.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
-            self._accept_thread = None
-        if self._listener is not None:
-            try:
-                self._listener.close()
-            except OSError as exc:
-                logger.debug(f"Listener close error: {exc}")
-            self._listener = None
-        logger.info(f"Proxy on port {self.listen_port} stopped")
-
-    def _accept_loop(self) -> None:
-        listener = self._listener
-        if listener is None:
-            return
-        while not self._stopping.is_set():
-            try:
-                readable, _, _ = select.select(
-                    [listener], [], [], SELECT_TIMEOUT_SECONDS
-                )
-            except OSError:
-                break
-            if not readable:
-                continue
-            try:
-                client, address = listener.accept()
-            except (BlockingIOError, ConnectionAbortedError):
-                # EAGAIN from the non-blocking race, or ECONNABORTED when a
-                # phone on flaky WiFi drops mid-handshake: transient, keep
-                # serving.
-                continue
-            except OSError as exc:
-                logger.warning(
-                    f"Proxy accept loop on port {self.listen_port} "
-                    f"stopping: {exc}"
-                )
-                break
-            with self._lock:
-                self._client_ips.add(address[0])
-            threading.Thread(
-                target=self._pump,
-                args=(client,),
-                name=f"xproxy-{self.listen_port}-{address[0]}",
-                daemon=True,
-            ).start()
-
-    def _pump(self, client: socket.socket) -> None:
-        try:
-            upstream = socket.create_connection(
-                (UPSTREAM_HOST, self.target_port),
-                timeout=UPSTREAM_CONNECT_TIMEOUT_SECONDS,
-            )
-            # recv() is only reached when select() reports readable, so it
-            # never blocks; the per-socket timeout is purely a send-stall
-            # backstop. Quiet-but-healthy connections (WebSockets, SSE,
-            # keep-alive) are unaffected - the timer arms only while a
-            # sendall has data a stalled peer refuses to read.
-            client.settimeout(SEND_STALL_TIMEOUT_SECONDS)
-            upstream.settimeout(SEND_STALL_TIMEOUT_SECONDS)
-        except OSError as exc:
-            logger.warning(
-                f"Upstream {UPSTREAM_HOST}:{self.target_port} unreachable: {exc}"
-            )
-            client.close()
-            return
-        sockets = [client, upstream]
-        try:
-            while not self._stopping.is_set():
-                readable, _, _ = select.select(
-                    sockets, [], [], SELECT_TIMEOUT_SECONDS
-                )
-                if not readable:
-                    continue
-                for source in readable:
-                    data = source.recv(BUFFER_SIZE)
-                    if not data:
-                        return
-                    destination = upstream if source is client else client
-                    destination.sendall(data)
-        except OSError as exc:
-            logger.debug(f"Proxy connection ended: {exc}")
-        finally:
-            for sock in (client, upstream):
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-
-
 class ProxyEngine:
-    """Owns all reverse proxy instances, keyed by service id."""
+    """Manages every active proxy listener."""
 
-    def __init__(self) -> None:
-        self._instances: dict[str, _ProxyInstance] = {}
+    def __init__(self, runner: AsyncRunner | None = None) -> None:
+        self._runner = runner or AsyncRunner()
+        self._owns_runner = runner is None
+        self._targets: dict[str, ProxyTarget] = {}
+        self._servers: dict[str, asyncio.Server] = {}
         self._lock = threading.Lock()
+        self._rewrite_map = RewriteMap()
+        self._smart = True
+
+    # ---- configuration (any thread) ----
+
+    def set_rewrite_map(self, rewrite_map: RewriteMap) -> None:
+        """Publish a new share map; sessions pick it up on their next request."""
+        self._rewrite_map = rewrite_map
+
+    def rewrite_map(self) -> RewriteMap:
+        """The share map currently in force."""
+        return self._rewrite_map
+
+    def set_smart_mode(self, enabled: bool) -> None:
+        """Toggle HTTP rewriting; off means byte-for-byte TCP relaying."""
+        self._smart = enabled
+
+    def smart_mode(self) -> bool:
+        """True when HTTP-aware rewriting is enabled."""
+        return self._smart
+
+    # ---- lifecycle ----
 
     def start_proxy(
-        self, service_id: str, listen_host: str, listen_port: int, target_port: int
+        self,
+        service_id: str,
+        listen_host: str,
+        listen_port: int,
+        target_port: int,
+        upstream_hosts: Sequence[str] | None = None,
+        upstream_tls: bool = False,
+        raw_mode: bool = False,
+        service_name: str = "",
     ) -> None:
-        """Start forwarding listen_host:listen_port to localhost:target_port."""
+        """Listen on listen_host:listen_port and forward to the local app.
+
+        upstream_hosts lists the local addresses to try (default: 127.0.0.1
+        then ::1). Raises ProxyError when the listener cannot be created.
+        """
         with self._lock:
-            if service_id in self._instances:
-                raise ProxyError(f"Service {service_id} already has a proxy")
-            instance = _ProxyInstance(
-                service_id, listen_host, listen_port, target_port
-            )
-            instance.start()
-            self._instances[service_id] = instance
+            if service_id in self._targets:
+                raise ProxyError(f"Service {service_id} is already proxied")
+        try:
+            listener = open_listener(listen_host, listen_port)
+        except OSError as exc:
+            raise ProxyError(f"Cannot bind {listen_host}:{listen_port}: {exc}") from exc
+        bound_port = int(listener.getsockname()[1])
+        target = ProxyTarget(
+            service_name=service_name,
+            local_port=target_port,
+            upstream_hosts=list(upstream_hosts or LOOPBACK_HOSTS),
+            upstream_tls=upstream_tls,
+            raw_mode=raw_mode,
+            listen_host=listen_host,
+            listen_port=bound_port,
+            smart_enabled=self.smart_mode,
+            rewrite_map=self.rewrite_map,
+        )
+        try:
+            server = self._runner.run(self._serve(listener, target), START_TIMEOUT_SECONDS)
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            listener.close()
+            raise ProxyError(f"Cannot start proxy on {listen_host}:{listen_port}: {exc}") from exc
+        with self._lock:
+            self._targets[service_id] = target
+            self._servers[service_id] = server
+        logger.info(
+            f"Proxy {service_id}: {listen_host}:{bound_port} -> localhost:{target_port}"
+            f"{' (TLS)' if upstream_tls else ''}{' (raw)' if raw_mode else ''}"
+        )
 
     def stop_proxy(self, service_id: str) -> None:
-        """Stop and forget the proxy registered for service_id, if any."""
+        """Stop one proxy and drop its connections. No-op if unknown."""
         with self._lock:
-            instance = self._instances.pop(service_id, None)
-        if instance is not None:
-            instance.stop()
+            target = self._targets.pop(service_id, None)
+            server = self._servers.pop(service_id, None)
+        if target is None or server is None:
+            return
+        try:
+            self._runner.run(self._close(server, target), STOP_TIMEOUT_SECONDS)
+        except (RuntimeError, TimeoutError) as exc:
+            logger.warning(f"Proxy {service_id} did not stop cleanly: {exc}")
+        logger.info(f"Proxy {service_id} stopped")
 
     def stop_all(self) -> None:
-        """Stop every proxy instance."""
+        """Stop every proxy (and the event loop if this engine owns it)."""
         with self._lock:
-            instances = list(self._instances.values())
-            self._instances.clear()
-        for instance in instances:
-            instance.stop()
+            service_ids = list(self._targets)
+        for service_id in service_ids:
+            self.stop_proxy(service_id)
+        if self._owns_runner:
+            self._runner.stop()
+
+    # ---- queries (any thread) ----
 
     def is_running(self, service_id: str) -> bool:
-        """Return True when service_id has a live proxy."""
+        """True while a proxy for service_id is listening."""
         with self._lock:
-            return service_id in self._instances
+            return service_id in self._targets
+
+    def listen_port(self, service_id: str) -> int | None:
+        """Port actually bound for service_id (useful when 0 was requested)."""
+        with self._lock:
+            target = self._targets.get(service_id)
+        return target.listen_port if target is not None else None
 
     def connected_devices(self, service_id: str) -> int:
-        """Unique clients seen by the proxy for service_id, or 0."""
+        """Devices that used this proxy in the last few minutes (0 if unknown)."""
+        stats = self.stats(service_id)
+        return stats.connected_devices if stats is not None else 0
+
+    def stats(self, service_id: str) -> ProxyStatsSnapshot | None:
+        """Counter snapshot for service_id, or None if it is not running."""
         with self._lock:
-            instance = self._instances.get(service_id)
-        return instance.connected_devices if instance else 0
+            target = self._targets.get(service_id)
+        return target.stats.snapshot() if target is not None else None
+
+    # ---- loop-thread internals ----
+
+    async def _serve(self, listener: socket.socket, target: ProxyTarget) -> asyncio.Server:
+        """Start accepting on an already-bound listener."""
+        return await asyncio.start_server(partial(self._handle, target), sock=listener)
+
+    @staticmethod
+    async def _handle(
+        target: ProxyTarget, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Serve one accepted connection."""
+        task = asyncio.current_task()
+        disable_nagle(writer.get_extra_info("socket"))
+        client = BufferedStream(reader, writer)
+        if task is not None:
+            target.tasks.add(task)
+        target.stats.connection_opened(client.peer_ip)
+        try:
+            await ProxySession(target, client).run()
+        except (StreamClosed, ClientGone) + SESSION_ERRORS as exc:
+            logger.debug(f"Connection from {client.peer_ip} ended: {exc!r}")
+        finally:
+            client.close()
+            target.stats.connection_closed(client.peer_ip)
+            if task is not None:
+                target.tasks.discard(task)
+
+    @staticmethod
+    async def _close(server: asyncio.Server, target: ProxyTarget) -> None:
+        """Stop listening, cancel live sessions, wait briefly for teardown."""
+        server.close()
+        tasks = list(target.tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.wait_for(server.wait_closed(), SERVER_CLOSE_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.debug("Server close timed out; connections were already cancelled")

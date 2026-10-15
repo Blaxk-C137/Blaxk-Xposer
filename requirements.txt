@@ -2,6 +2,10 @@ PyGObject>=3.42
 qrcode>=7.4
 Pillow>=9.0
 psutil>=5.9
-# netifaces is OPTIONAL: unmaintained, fails to build on Python 3.12+.
-# NetworkDetector falls back to stdlib socket/ioctl detection when absent.
-# netifaces>=0.11
+# zeroconf is OPTIONAL (new dependency, pending approval): it publishes
+# custom .local links where Avahi is unavailable — always on Windows, and
+# on Linux systems without avahi-daemon. Without it, Linux uses Avahi and
+# everything else keeps working with the IP link.
+# zeroconf>=0.131
+# netifaces is no longer used: psutil provides network interfaces on
+# every platform.

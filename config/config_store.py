@@ -1,7 +1,8 @@
 """Read and write the Xposer configuration file.
 
 ConfigStore is the only component that touches disk for configuration,
-persistence, or autostart state.
+persistence, or autostart state (XDG desktop entry on Linux, the per-user
+Run registry key on Windows).
 """
 
 import json
@@ -10,15 +11,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from models.service import SavedService
-
 from utils.logger import get_logger
+from utils.platform_env import IS_LINUX, IS_WINDOWS, config_dir, gui_python_executable
 
-CONFIG_VERSION = "1.0.0"
-DEFAULT_CONFIG_DIR = Path.home() / ".config" / "xposer"
+CONFIG_VERSION = "1.1.0"
+DEFAULT_CONFIG_DIR = config_dir()
 DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.json"
 MAIN_ENTRY_PATH = Path(__file__).resolve().parent.parent / "main.py"
 AUTOSTART_DIR = Path.home() / ".config" / "autostart"
 AUTOSTART_FILE = AUTOSTART_DIR / "xposer.desktop"
+WINDOWS_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+WINDOWS_RUN_VALUE = "Xposer"
 
 AUTOSTART_DESKTOP_ENTRY_TEMPLATE = """[Desktop Entry]
 Type=Application
@@ -27,9 +30,14 @@ Comment=Expose local ports and folders over WiFi
 Exec={exec_command}
 Terminal=false
 Categories=Network;
+X-GNOME-Autostart-enabled=true
 """
 
 logger = get_logger("config")
+
+
+class AutostartError(RuntimeError):
+    """Raised when start-on-login cannot be changed on this system."""
 
 
 @dataclass
@@ -40,6 +48,12 @@ class AppConfig:
     network_interface: str | None = None
     start_on_login: bool = False
     saved_services: list[SavedService] = field(default_factory=list)
+    smart_proxy: bool = True
+
+
+def autostart_supported() -> bool:
+    """True where Xposer knows how to register itself to start on login."""
+    return IS_LINUX or IS_WINDOWS
 
 
 class ConfigStore:
@@ -85,24 +99,65 @@ class ConfigStore:
             tmp_path.replace(self._path)
 
     def set_start_on_login(self, enabled: bool) -> None:
-        """Install or remove the XDG autostart desktop entry."""
-        if enabled:
-            AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
-            AUTOSTART_FILE.write_text(self._desktop_entry_text(), encoding="utf-8")
-        else:
-            AUTOSTART_FILE.unlink(missing_ok=True)
+        """Register or unregister Xposer to start when the user logs in.
+
+        Raises AutostartError when the platform is unsupported or the
+        system refuses the change.
+        """
+        if IS_WINDOWS:
+            self._set_windows_autostart(enabled)
+            return
+        if not IS_LINUX:
+            raise AutostartError("Start on login is not supported on this system")
+        try:
+            if enabled:
+                AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
+                AUTOSTART_FILE.write_text(self._desktop_entry_text(), encoding="utf-8")
+            else:
+                AUTOSTART_FILE.unlink(missing_ok=True)
+        except OSError as exc:
+            raise AutostartError(f"Could not update {AUTOSTART_FILE}: {exc}") from exc
 
     @staticmethod
-    def _desktop_entry_text() -> str:
+    def launch_command() -> str:
+        """Command line that starts this copy of Xposer without a console."""
+        return f'"{gui_python_executable()}" "{MAIN_ENTRY_PATH}"'
+
+    @classmethod
+    def _desktop_entry_text(cls) -> str:
         """Build the desktop entry launching Xposer from its real location.
 
-        The path is double-quoted per the Desktop Entry spec so installs
-        under directories containing spaces still resolve.
+        Paths are double-quoted per the Desktop Entry spec so installs
+        under directories containing spaces still resolve, and the running
+        interpreter is used so virtualenv installs keep working.
         """
-        exec_command = f'python3 "{MAIN_ENTRY_PATH}"'
-        return AUTOSTART_DESKTOP_ENTRY_TEMPLATE.format(exec_command=exec_command)
+        return AUTOSTART_DESKTOP_ENTRY_TEMPLATE.format(exec_command=cls.launch_command())
+
+    @classmethod
+    def _set_windows_autostart(cls, enabled: bool) -> None:
+        """Write or delete HKCU\\...\\Run\\Xposer (no admin rights needed)."""
+        try:
+            import winreg
+        except ImportError as exc:
+            raise AutostartError("Windows registry is unavailable") from exc
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, WINDOWS_RUN_KEY, 0, winreg.KEY_SET_VALUE
+            ) as key:
+                if enabled:
+                    winreg.SetValueEx(
+                        key, WINDOWS_RUN_VALUE, 0, winreg.REG_SZ, cls.launch_command()
+                    )
+                else:
+                    try:
+                        winreg.DeleteValue(key, WINDOWS_RUN_VALUE)
+                    except FileNotFoundError:
+                        pass
+        except OSError as exc:
+            raise AutostartError(f"Could not update the Run registry key: {exc}") from exc
 
     def _parse(self, raw: dict[str, object]) -> AppConfig:
+        """Build an AppConfig from parsed JSON, skipping malformed entries."""
         saved: list[SavedService] = []
         entries = raw.get("saved_services", [])
         if isinstance(entries, list):
@@ -119,13 +174,16 @@ class ConfigStore:
             network_interface=str(interface) if interface is not None else None,
             start_on_login=bool(raw.get("start_on_login", False)),
             saved_services=saved,
+            smart_proxy=bool(raw.get("smart_proxy", True)),
         )
 
     @staticmethod
     def _dump(config: AppConfig) -> dict[str, object]:
+        """JSON-ready dictionary for an AppConfig."""
         return {
-            "version": config.version,
+            "version": CONFIG_VERSION,
             "network_interface": config.network_interface,
             "start_on_login": config.start_on_login,
+            "smart_proxy": config.smart_proxy,
             "saved_services": [saved.to_dict() for saved in config.saved_services],
         }

@@ -59,6 +59,8 @@ def test_malformed_entries_are_skipped(tmp_path):
 
 
 def test_start_on_login_toggle(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_module, "IS_WINDOWS", False)
+    monkeypatch.setattr(config_module, "IS_LINUX", True)
     autostart = tmp_path / "autostart"
     monkeypatch.setattr(config_module, "AUTOSTART_DIR", autostart)
     monkeypatch.setattr(config_module, "AUTOSTART_FILE", autostart / "xposer.desktop")
@@ -70,6 +72,8 @@ def test_start_on_login_toggle(tmp_path, monkeypatch):
 
 
 def test_autostart_entry_targets_real_entry_point(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_module, "IS_WINDOWS", False)
+    monkeypatch.setattr(config_module, "IS_LINUX", True)
     autostart = tmp_path / "autostart"
     monkeypatch.setattr(config_module, "AUTOSTART_DIR", autostart)
     monkeypatch.setattr(config_module, "AUTOSTART_FILE", autostart / "xposer.desktop")

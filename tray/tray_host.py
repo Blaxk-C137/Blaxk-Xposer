@@ -3,6 +3,8 @@
 An AppIndicator only becomes visible when a StatusNotifierHost is
 listening - on GNOME Wayland without the AppIndicator extension there is
 none, and an indicator constructed anyway silently never appears.
+Windows has no session bus; its tray always exists, so this check is
+Linux-only.
 """
 
 import gi
@@ -11,11 +13,13 @@ gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib
 
 from utils.logger import get_logger
+from utils.platform_env import IS_WINDOWS
 
 WATCHER_NAME = "org.kde.StatusNotifierWatcher"
 DBUS_SERVICE_NAME = "org.freedesktop.DBus"
 DBUS_OBJECT_PATH = "/org/freedesktop/DBus"
 DBUS_INTERFACE_NAME = "org.freedesktop.DBus"
+DBUS_TIMEOUT_MILLISECONDS = 2000
 
 logger = get_logger("tray")
 
@@ -26,6 +30,8 @@ def tray_host_available(connection: Gio.DBusConnection | None = None) -> bool:
     Any bus error counts as "no host": a session where we cannot even ask
     is a session where no icon will be shown.
     """
+    if IS_WINDOWS and connection is None:
+        return False
     try:
         if connection is None:
             connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
@@ -37,7 +43,7 @@ def tray_host_available(connection: Gio.DBusConnection | None = None) -> bool:
             GLib.Variant("(s)", (WATCHER_NAME,)),
             GLib.VariantType("(b)"),
             Gio.DBusCallFlags.NONE,
-            -1,
+            DBUS_TIMEOUT_MILLISECONDS,
             None,
         )
     except GLib.Error as exc:

@@ -8,10 +8,11 @@ from pathlib import Path
 import qrcode
 
 from utils.logger import get_logger
+from utils.platform_env import cache_dir
 
 logger = get_logger("qr")
 
-DEFAULT_QR_DIR = Path.home() / ".cache" / "xposer" / "qr"
+DEFAULT_QR_DIR = cache_dir() / "qr"
 QR_BOX_SIZE = 10
 QR_BORDER = 2
 FILENAME_SAFE_PATTERN = re.compile(r"[^A-Za-z0-9_-]+")
@@ -28,14 +29,19 @@ class QRGenerator:
         """Render url as a QR code PNG and return the written path.
 
         The filename carries a short hash of the url so two services with
-        the same name can never overwrite each other's code.
+        the same name can never overwrite each other's code, and an image
+        that already exists for the same name and url is reused as is.
         """
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        image = qrcode.make(url, box_size=QR_BOX_SIZE, border=QR_BORDER)
         digest = hashlib.sha1(url.encode("utf-8")).hexdigest()
         suffix = digest[:FILENAME_HASH_LENGTH]
         path = self._output_dir / f"{self._safe_name(service_name)}-{suffix}.png"
-        image.save(path, format="PNG")
+        if path.is_file() and path.stat().st_size > 0:
+            return path
+        image = qrcode.make(url, box_size=QR_BOX_SIZE, border=QR_BORDER)
+        temporary = path.with_suffix(".tmp")
+        image.save(temporary, format="PNG")
+        temporary.replace(path)
         logger.info(f"QR code written to {path}")
         return path
 
@@ -48,5 +54,6 @@ class QRGenerator:
 
     @staticmethod
     def _safe_name(service_name: str) -> str:
+        """Filesystem-safe slug of a service name."""
         slug = FILENAME_SAFE_PATTERN.sub("_", service_name.strip()).strip("_")
         return slug or "service"

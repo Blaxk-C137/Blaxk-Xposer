@@ -1,11 +1,13 @@
 """Tests for tray host availability detection."""
 
-import gi
+import pytest
+
+gi = pytest.importorskip("gi")
 
 gi.require_version("Gio", "2.0")
-from gi.repository import GLib, Gio
+from gi.repository import GLib  # noqa: E402
 
-from tray.tray_host import WATCHER_NAME, tray_host_available
+from tray.tray_host import WATCHER_NAME, tray_host_available  # noqa: E402
 
 
 class FakeConnection:

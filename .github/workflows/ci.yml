@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    name: Linux (full suite, GTK under Xvfb)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK, tray and Python packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
+            python3-psutil python3-pil python3-qrcode python3-zeroconf python3-pytest \
+            xvfb xauth dbus-x11 adwaita-icon-theme
+      - name: Test
+        run: dbus-run-session -- xvfb-run -a python3 -m pytest -p no:cacheprovider
+
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff
+      # E402: PyGObject requires gi.require_version() before gi.repository imports.
+      - run: ruff check --select E,F,W,B,UP,I --ignore E402,E501 --target-version py310 .
+
+  windows:
+    name: Windows (networking core, no GTK)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    # The GTK tests skip without PyGObject; this job exercises the proxy,
+    # file server, detector and manager on real Windows sockets.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install psutil qrcode pillow zeroconf pytest
+      - run: python -m pytest -p no:cacheprovider

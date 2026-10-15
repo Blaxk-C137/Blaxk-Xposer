@@ -1,11 +1,14 @@
-"""Tests for the avahi-publish wrapper and hostname normalization."""
+"""Tests for mDNS publishing backends, reference counting and names."""
 
-import subprocess
+import sys
+import types
 
 import pytest
 
 from network.mdns_publisher import (
+    AvahiBackend,
     MdnsPublisher,
+    ZeroconfBackend,
     normalize_hostname,
     to_local_name,
 )
@@ -96,13 +99,131 @@ def test_unpublish_after_spawn_failure_is_noop():
     publisher.unpublish("myapp.local")  # must not raise
 
 
+def avahi_processes(publisher: MdnsPublisher) -> dict:
+    """The avahi backend's live process table."""
+    backend = publisher._backends[0]
+    assert isinstance(backend, AvahiBackend)
+    return backend._processes
+
+
 def test_publish_replaces_previous_process_for_same_hostname():
     publisher, _ = make_publisher()
     publisher.publish("myapp.local", "192.168.1.5")
-    first = publisher._processes["myapp.local"]
+    first = avahi_processes(publisher)["myapp.local"]
     publisher.publish("myapp.local", "192.168.1.6")
     assert first.terminated, "old process left running"
-    assert publisher._processes["myapp.local"] is not first
+    assert avahi_processes(publisher)["myapp.local"] is not first
+
+
+# ---- reference counting and fallback ----
+
+
+class RecordingBackend:
+    """Backend double that can be told to refuse."""
+
+    def __init__(self, name: str, accept: bool = True) -> None:
+        self.name = name
+        self.accept = accept
+        self.published: dict[str, str] = {}
+        self.closed = False
+
+    def publish(self, hostname: str, ip: str, port: int) -> bool:
+        if self.accept:
+            self.published[hostname] = ip
+        return self.accept
+
+    def unpublish(self, hostname: str) -> None:
+        self.published.pop(hostname, None)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_shared_hostname_survives_until_last_user_stops():
+    backend = RecordingBackend("fake")
+    publisher = MdnsPublisher(backends=[backend])
+    assert publisher.publish("shop.local", "192.168.1.5", 5173)
+    assert publisher.publish("shop.local", "192.168.1.5", 8000)
+    publisher.unpublish("shop.local")
+    assert backend.published == {"shop.local": "192.168.1.5"}
+    publisher.unpublish("shop.local")
+    assert backend.published == {}
+
+
+def test_falls_back_to_next_backend():
+    broken = RecordingBackend("avahi", accept=False)
+    working = RecordingBackend("zeroconf")
+    publisher = MdnsPublisher(backends=[broken, working])
+    assert publisher.publish("shop.local", "192.168.1.5")
+    assert publisher.active_backend("shop.local") == "zeroconf"
+    assert publisher.backend_names() == ["avahi", "zeroconf"]
+
+
+def test_no_backends_means_no_custom_links():
+    publisher = MdnsPublisher(backends=[])
+    assert publisher.available is False
+    assert publisher.publish("shop.local", "192.168.1.5") is False
+
+
+def test_update_ip_republishes_every_name():
+    backend = RecordingBackend("fake")
+    publisher = MdnsPublisher(backends=[backend])
+    publisher.publish("a.local", "192.168.1.5")
+    publisher.publish("b.local", "192.168.1.5")
+    assert publisher.update_ip("192.168.1.9") == []
+    assert backend.published == {"a.local": "192.168.1.9", "b.local": "192.168.1.9"}
+    publisher.unpublish("a.local")
+    assert "a.local" not in backend.published
+
+
+def test_stop_all_withdraws_and_closes():
+    backend = RecordingBackend("fake")
+    publisher = MdnsPublisher(backends=[backend])
+    publisher.publish("a.local", "192.168.1.5")
+    publisher.publish("a.local", "192.168.1.5")
+    publisher.stop_all()
+    assert backend.published == {}
+    assert backend.closed
+
+
+def test_zeroconf_backend_registers_hostname_as_server(monkeypatch):
+    registered: list[object] = []
+    unregistered: list[object] = []
+
+    class FakeServiceInfo:
+        def __init__(self, type_: str, name: str, **kwargs: object) -> None:
+            self.type = type_
+            self.name = name
+            self.kwargs = kwargs
+
+    class FakeZeroconf:
+        def __init__(self, ip_version: object) -> None:
+            self.closed = False
+
+        def register_service(self, info: object, allow_name_change: bool) -> None:
+            registered.append(info)
+
+        def unregister_service(self, info: object) -> None:
+            unregistered.append(info)
+
+        def close(self) -> None:
+            self.closed = True
+
+    fake = types.ModuleType("zeroconf")
+    fake.Zeroconf = FakeZeroconf
+    fake.ServiceInfo = FakeServiceInfo
+    fake.IPVersion = types.SimpleNamespace(V4Only="v4")
+    fake.Error = type("Error", (Exception,), {})
+    monkeypatch.setitem(sys.modules, "zeroconf", fake)
+    backend = ZeroconfBackend()
+    assert backend.publish("shop.local", "192.168.1.5", 5173) is True
+    info = registered[0]
+    assert info.name == "shop._http._tcp.local."
+    assert info.kwargs["server"] == "shop.local."
+    assert info.kwargs["port"] == 5173
+    assert info.kwargs["addresses"] == [bytes([192, 168, 1, 5])]
+    backend.close()
+    assert unregistered == [info]
 
 
 # ---- hostname normalization ----

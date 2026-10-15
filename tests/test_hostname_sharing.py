@@ -1,16 +1,14 @@
 """Hostname (.local) sharing through ServiceManager with a fake publisher."""
 
+import http.server
+
 import pytest
 
 from config.config_store import ConfigStore
-from network.mdns_publisher import MdnsPublisher
 from network.network_detector import NetworkDetector
 from network.qr_generator import QRGenerator
 from services.service_manager import ServiceManager, ValidationError
 from tests.test_service_manager import open_local_listener
-
-import threading
-import http.server
 
 
 class FakePublisher:
@@ -21,9 +19,15 @@ class FakePublisher:
         self.published: list[tuple[str, str]] = []
         self.unpublished: list[str] = []
 
-    def publish(self, hostname: str, ip: str) -> bool:
+    def publish(self, hostname: str, ip: str, port: int = 0) -> bool:
         self.published.append((hostname, ip))
         return self.publish_ok
+
+    def update_ip(self, ip: str) -> list[str]:
+        return []
+
+    def backend_names(self) -> list[str]:
+        return ["fake"]
 
     def unpublish(self, hostname: str) -> None:
         self.unpublished.append(hostname)
@@ -148,7 +152,7 @@ def test_hostname_persisted_in_saved_service(stack, tmp_path):
     site = tmp_path / "persist-site"
     site.mkdir()
     (site / "index.html").write_text("x", encoding="utf-8")
-    service = manager.serve_folder("Site", str(site), hostname="kept")
+    manager.serve_folder("Site", str(site), hostname="kept")
     saved = manager._config_store.load().saved_services[-1]
     assert saved.hostname == "kept.local"
     assert saved.to_dict()["hostname"] == "kept.local"
@@ -167,15 +171,21 @@ def test_shutdown_unpublishes_all_hostnames(stack):
 
 
 # ---- UI wiring (GTK) ----
+# Imported softly: a module-level importorskip would also skip the
+# manager tests above on systems without PyGObject (e.g. Windows CI).
 
-gi = pytest.importorskip("gi")
-import gi as _gi  # noqa: E402
+try:
+    import gi as _gi
 
-_gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk  # noqa: E402
+    _gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk
+except (ImportError, ValueError):
+    Gtk = None
 
 
 def _gtk_ready() -> bool:
+    if Gtk is None:
+        return False
     try:
         result = Gtk.init_check()
         return bool(result[0] if isinstance(result, tuple) else result)
@@ -208,11 +218,11 @@ class StubManager:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
-    def expose_port(self, name, port, hostname=None):
+    def expose_port(self, name, port, hostname=None, share_scheme=None):
         self.calls.append(("expose", name, port, hostname))
         return StubService()
 
-    def serve_folder(self, name, folder_path, hostname=None):
+    def serve_folder(self, name, folder_path, hostname=None, options=None):
         self.calls.append(("serve", name, folder_path, hostname))
         return StubService()
 

@@ -80,7 +80,7 @@ def test_panel_refresh_reflects_stopped_service(components, running_service):
     # Stopped services stay listed (restartable), just visually dimmed.
     assert not panel._empty_label.get_mapped(), "stopped row disappeared"
     row = panel._rows_box.get_children()[0]
-    assert row._toggle_button.get_label() == "▶", "stop did not refresh row"
+    assert row._toggle_button.get_tooltip_text() == "Start sharing", "stop did not refresh row"
     panel.destroy()
     pump_gtk_events()
 
@@ -147,9 +147,9 @@ def test_tray_menu_contains_status_panel_item(components):
     pump_gtk_events()
     labels = [
         item.get_label()
-        for item in tray._indicator.get_menu().get_children()
+        for item in tray.menu.get_children()
         if hasattr(item, "get_label") and item.get_label()
     ]
-    assert any("Status Panel" in label for label in labels), (
-        "Status Panel missing from tray menu"
+    assert any("Open Xposer" in label for label in labels), (
+        "dashboard entry missing from tray menu"
     )
